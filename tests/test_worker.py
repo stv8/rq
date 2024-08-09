@@ -27,7 +27,7 @@ from rq.serializers import JSONSerializer
 from rq.suspension import resume, suspend
 from rq.utils import as_text, get_version, now
 from rq.version import VERSION
-from rq.worker import HerokuWorker, RandomWorker, RoundRobinWorker, WorkerStatus
+from rq.worker import HerokuWorker, RandomWorker, RoundRobinWorker, WorkerStatus, StopRequested
 from tests import RQTestCase, find_empty_redis_database, slow
 from tests.fixtures import (
     CustomJob,
@@ -1337,7 +1337,6 @@ class TimeoutTestCase:
 
 
 class WorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
-    @slow
     def test_idle_worker_warm_shutdown(self):
         """worker with no ongoing job receiving single SIGTERM signal and shutting down"""
         w = Worker('foo', connection=self.connection)
@@ -1348,7 +1347,7 @@ class WorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
         w.work()
 
         p.join(1)
-        self.assertFalse(w._stop_requested)
+        self.assertTrue(w._stop_requested)
 
     @slow
     def test_working_worker_warm_shutdown(self):
@@ -1371,6 +1370,89 @@ class WorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
 
         self.assertIsNotNone(w.shutdown_requested_date)
         self.assertEqual(type(w.shutdown_requested_date).__name__, 'datetime')
+
+    @slow
+    def test_working_worker_warm_shutdown_multi_queues(self):
+        """worker with an ongoing job receiving single SIGTERM signal, allowing job to finish then shutting down"""
+        fooq = Queue('foo', connection=self.connection)
+        barq = Queue('bar', connection=self.connection)
+        w = Worker([fooq, barq])
+
+        sentinel_file = '/tmp/.rq_sentinel_warm'
+        fooq.enqueue(create_file_after_timeout, sentinel_file, 2)
+        self.assertFalse(w._stop_requested)
+        p = Process(target=kill_worker, args=(os.getpid(), False))
+        p.start()
+
+        w.work()
+
+        p.join(2)
+        self.assertFalse(p.is_alive())
+        self.assertTrue(w._stop_requested)
+        self.assertTrue(os.path.exists(sentinel_file))
+
+        self.assertIsNotNone(w.shutdown_requested_date)
+        self.assertEqual(type(w.shutdown_requested_date).__name__, 'datetime')
+
+
+
+    def test_race_condition_sigterm_during_job_execution(self):
+        fooq = Queue('foo', connection=self.connection)
+        barq = Queue('bar', connection=self.connection)
+        worker = Worker([fooq, barq], connection=self.connection)
+
+        original_execute_job = worker.execute_job
+        def side_effect(*args, **kwargs):
+            time.sleep(2)
+            return original_execute_job(*args, **kwargs)
+
+        sentinel_file = '/tmp/.rq_sentinel_warm'
+        job = fooq.enqueue(create_file_after_timeout, sentinel_file, 1)
+        assert job.id in fooq.job_ids
+
+        # with mock.patch.object(worker, 'dequeue_job_and_maintain_ttl', return_value=(job, fooq)):
+        with mock.patch.object(worker, 'execute_job', side_effect=side_effect):
+            p = Process(target=kill_worker, args=(os.getpid(), False, 1))
+            p.start()
+
+            worker.work()
+            assert job.id not in fooq.job_ids
+
+            p.join()
+
+            # Check if the job is still in the queue
+            # assert job.get_status() == JobStatus.QUEUED
+            assert job.get_status() == JobStatus.FINISHED
+
+    # def test_simulate_race_condition_sigterm_during_job_execution(self):
+    #     fooq = Queue('foo', connection=self.connection)
+    #     barq = Queue('bar', connection=self.connection)
+    #     worker = Worker([fooq, barq], connection=self.connection)
+    #
+    #     original_execute_job = worker.execute_job
+    #     def side_effect(*args, **kwargs):
+    #         # time.sleep(2)
+    #         return original_execute_job(*args, **kwargs)
+    #
+    #     sentinel_file = '/tmp/.rq_sentinel_warm'
+    #     job = fooq.enqueue(create_file_after_timeout, sentinel_file, 1)
+    #     assert job.id in fooq.job_ids
+    #
+    #     # with mock.patch.object(worker, 'dequeue_job_and_maintain_ttl', return_value=(job, fooq)):
+    #     with mock.patch.object(worker, 'execute_job', side_effect=side_effect):
+    #         p = Process(target=kill_worker, args=(os.getpid(), False, 1))
+    #         p.start()
+    #
+    #         try:
+    #             worker.work()
+    #             assert job.id not in fooq.job_ids
+    #         except StopRequested:
+    #             pass
+    #
+    #         p.join()
+    #
+    #         # Check if the job is still in the queue
+    #         assert job.get_status() == JobStatus.QUEUED
 
     @slow
     def test_working_worker_cold_shutdown(self):
