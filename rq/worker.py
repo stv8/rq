@@ -590,7 +590,8 @@ class BaseWorker:
                     # Cold shutdown detected
                     raise
 
-                except:  # noqa
+                except Exception as e:  # noqa
+                    print("in except", e)
                     self.log.error('Worker %s: found an unhandled exception, quitting...', self.key, exc_info=True)
                     break
         finally:
@@ -1238,21 +1239,36 @@ class Worker(BaseWorker):
         self.handle_warm_shutdown_request()
         self._shutdown()
 
+    # def _shutdown(self):
+    #     """
+    #     If shutdown is requested in the middle of a job, wait until
+    #     finish before shutting down and save the request in redis
+    #     """
+    #     if self.get_state() == WorkerStatus.BUSY:
+    #         self._stop_requested = True
+    #         self.set_shutdown_requested_date()
+    #         self.log.debug('Stopping after current horse is finished. Press Ctrl+C again for a cold shutdown.')
+    #         if self.scheduler:
+    #             self.stop_scheduler()
+    #     else:
+    #         if self.scheduler:
+    #             self.stop_scheduler()
+    #         raise StopRequested()
+    #
     def _shutdown(self):
         """
         If shutdown is requested in the middle of a job, wait until
         finish before shutting down and save the request in redis
         """
         if self.get_state() == WorkerStatus.BUSY:
-            self._stop_requested = True
-            self.set_shutdown_requested_date()
             self.log.debug('Stopping after current horse is finished. Press Ctrl+C again for a cold shutdown.')
-            if self.scheduler:
-                self.stop_scheduler()
-        else:
-            if self.scheduler:
-                self.stop_scheduler()
-            raise StopRequested()
+
+        # removing the raise causes the blpop to still hang
+        self._stop_requested = True
+        print("setting stop_requested")
+        self.set_shutdown_requested_date()
+        if self.scheduler:
+            self.stop_scheduler()
 
     def fork_work_horse(self, job: 'Job', queue: 'Queue'):
         """Spawns a work horse to perform the actual work and passes it a job.
